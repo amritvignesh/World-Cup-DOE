@@ -15,13 +15,8 @@ matches <- FreeMatches(comps)
 events <- free_allevents(matches, Parallel = T)
 events <- allclean(events) 
 
-goals <- events %>%
-  filter(shot.outcome.name == "Goal")
-
-goals <- shotinfo(goals)
-
 proc_events <- events %>%
-  mutate(pos_id = paste0(match_id, "-", possession), ball_receipt = ifelse(type.name == "Ball Receipt*" & is.na(ball_receipt.outcome.name), 1, 0)) %>%
+  mutate(pos_id = paste0(match_id, "-", possession), ball_receipt = ifelse(type.name == "Ball Receipt*" & is.na(ball_receipt.outcome.name), 1, 0), goal = ifelse(is.na(shot.outcome.name), 0, ifelse(shot.outcome.name == "Goal", 1, 0))) %>%
   group_by(pos_id) %>%
   mutate(prev_ball_receipts = cumsum(ball_receipt) - ball_receipt) %>%
   ungroup() %>%
@@ -49,7 +44,32 @@ final_formation <- formations %>%
                                (keep_team_num == 2 & possession_team.id != team.id) ~ team_1)) %>%
   select(index, match_id, formation)
 
-final_events <- left_join(proc_events, final_formation, by = c("index", "match_id")) 
+events_nogoals <- left_join(proc_events, final_formation, by = c("index", "match_id")) 
+
+select_events_2 <- proc_events %>%
+  select(index, match_id, type.name, possession_team.id, team.id, goal) 
+
+goals <- select_events_2 %>%
+  group_by(match_id, team.id) %>%
+  mutate(team_score = cumsum(goal)) %>%
+  ungroup()
+
+# the above technically does not account for penalties but no ball reciepts in penalties so doesnt matter
+
+final_goals <- goals %>%
+  group_by(match_id) %>%
+  mutate(team_num = as.character(dense_rank(team.id)), keep_team_num = team_num) %>%
+  pivot_wider(names_from = team_num, values_from = team_score, 
+              names_prefix = "score_") %>%
+  fill(score_1, .direction = "downup") %>%
+  fill(score_2, .direction = "downup") %>%
+  mutate(score_diff = case_when((keep_team_num == 1 & possession_team.id == team.id) ~ score_1 - score_2,
+                               (keep_team_num == 1 & possession_team.id != team.id) ~ score_2 - score_1,
+                               (keep_team_num == 2 & possession_team.id == team.id) ~ score_2 - score_1,
+                               (keep_team_num == 2 & possession_team.id != team.id) ~ score_1 - score_2)) %>%
+  select(index, match_id, score_diff)
+
+final_events <- left_join(events_nogoals, final_goals, by = c("index", "match_id"))
 
 data <- final_events %>%
   filter(type.name == "Ball Receipt*") %>%
@@ -57,7 +77,7 @@ data <- final_events %>%
   separate(location, into = c("x", "y"), sep = ",", convert = TRUE) %>%
   mutate(dist_goal = sqrt(x^2 + (y-40)^2)) %>%
   group_by(match_id, possession_team.id) %>%
-  select(name = player.name, id = player.id, match_id, dist_goal, position, time, prev_ball_receipts, formation, under_pressure_prev, counterpress_prev)
+  select(name = player.name, id = player.id, match_id, dist_goal, position, time, prev_ball_receipts, formation, under_pressure_prev, counterpress_prev, score_diff)
 
 group_stage_matches <- matches %>%
   mutate(group_stage = ifelse(competition_stage.name == "Group Stage", 1, 0)) %>%
@@ -82,8 +102,8 @@ xgboost_test <- final_data %>%
   filter(group_stage != 1)
 
 labels_train <- as.matrix(xgboost_train[, 5])
-xgboost_trainfinal <- as.matrix(xgboost_train[, c(6:9, 11:44)])
-xgboost_testfinal <- as.matrix(xgboost_test[, c(6:9, 11:44)])
+xgboost_trainfinal <- as.matrix(xgboost_train[, c(6:10, 12:45)])
+xgboost_testfinal <- as.matrix(xgboost_test[, c(6:10, 12:45)])
 
 doe_model <- xgboost(data = xgboost_trainfinal, label = labels_train, nrounds = 100, objective = "reg:squarederror", early_stopping_rounds = 10, max_depth = 6, eta = 0.3)
 
@@ -94,7 +114,7 @@ dist <- as.matrix(xgboost_test[,5])
 postResample(dist_predicted, dist)
 
 dist_predictions <- as.data.frame(
-  matrix(predict(doe_model, as.matrix(final_data[,c(6:9, 11:44)])))
+  matrix(predict(doe_model, as.matrix(final_data[,c(6:10, 12:45)])))
 )
 
 all_stats <- cbind(final_data, dist_predictions) %>%
@@ -149,7 +169,7 @@ t10 <- top10 %>% gt() %>%
     doe = md("**DOE (Yards)**")
   ) %>%
   tab_header(
-    title = md("**2022 FIFA World Cup Knockout Top 10 DOE (Average Distance from GK Over Expected)**"),
+    title = md("**2022 FIFA World Cup Knockout Top 10 DOE (Average Distance from Own Goal Over Expected)**"),
     subtitle = "Trained Data From 2022 FIFA World Cup Group Stage"
   ) %>%
   opt_align_table_header(align = "center")
@@ -171,7 +191,7 @@ b10 <- bot10 %>% gt() %>%
     doe = md("**DOE (Yards)**")
   ) %>%
   tab_header(
-    title = md("**2022 FIFA World Cup Knockout Bottom 10 DOE (Average Distance from GK Over Expected)**"),
+    title = md("**2022 FIFA World Cup Knockout Bottom 10 DOE (Average Distance from Own Goal Over Expected)**"),
     subtitle = "Trained Data From 2022 FIFA World Cup Group Stage"
   ) %>%
   opt_align_table_header(align = "center")
